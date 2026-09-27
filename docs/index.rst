@@ -160,7 +160,7 @@ References
    :hidden:
    :caption: Tutorials
 
-   Low overhead error detection using spacetime codes <https://quantum.cloud.ibm.com/docs/en/tutorials/spacetime-codes>
+   Low overhead error detection using spacetime codes <https://quantum.cloud.ibm.com/docs/tutorials/spacetime-codes>
 
 .. toctree::
    :hidden:
