@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from functools import cached_property
 from itertools import groupby
@@ -32,11 +32,13 @@ from ._internal import Metric as _Metric
 from ._internal import NoiseModel as _RustNoiseModel
 from ._internal.conversion import convert_noise_model as _convert_noise_model
 from ._internal.conversion import convert_to_rustiq_circuit as _convert_to_rustiq_circuit
+from ._internal.doping import dope_circuit as _dope_circuit
 from ._internal.utils import build_check_picker as _build_check_picker
 from ._internal.utils import validate_terminal_measurements as _validate_terminal_measurements
 from .noise_models import NoiseModel
+from .wire import Wire
 
-# Non-unitary instructions :meth:`CheckedCircuit.box` accepts; all else is rejected.
+# Non-unitary instructions :meth:`CheckedCircuit.box` accepts. All else is rejected.
 _NON_GATES = frozenset({"measure", "barrier"})
 
 BOXING_DEFAULTS: dict[str, Any] = {
@@ -56,7 +58,7 @@ class UncoveredPauli(NamedTuple):
 
     Attributes:
         qubit: Index of the qubit where the undetected error sits
-        after_instruction: Index (into ``circuit.data``) of the instruction the error occurs after;
+        after_instruction: Index (into ``circuit.data``) of the instruction the error occurs after.
             ``None`` means the error sits on the qubit's input wire.
         pauli: The undetected Pauli error (``"X"``, ``"Y"``, or ``"Z"``)
     """
@@ -141,6 +143,9 @@ class CheckedCircuit:
         Each entry is an ``UncoveredPauli(qubit, after_instruction, pauli)`` triple. Only
         input wires and wires immediately after 2-qubit gates are enumerated; errors after
         single qubit gates are folded into the next 2-qubit-gate wire.
+
+        Raises:
+            ValueError: :attr:`circuit` contains a non-Clifford instruction.
         """
         check_picker = _build_check_picker(
             self.circuit,
@@ -304,6 +309,90 @@ class CheckedCircuit:
             shots=shots,
         )
 
+    def dope(
+        self,
+        num_sites: int | None = None,
+        *,
+        wires: Literal["all", "after_entangling", "before_entangling"] = "all",
+        angle: float | None = np.pi / 4,
+        seed: int | np.random.Generator | None = None,
+        box: bool = False,
+        payload_layers: Iterable[Iterable[tuple[int, int]]] | None = None,
+        box_options: Mapping[str, Any] | None = None,
+    ) -> tuple[QuantumCircuit, tuple[Wire, ...]]:
+        r"""Dope ``self.circuit`` with :class:`~qiskit.circuit.library.RZGate` rotations that commute with check stabilizers.
+
+        See `arXiv:2607.25941 <https://arxiv.org/abs/2607.25941>`_ for more details.
+
+        Args:
+            num_sites: Number of :class:`~qiskit.circuit.library.RZGate` rotations to place in
+                the circuit. ``None`` uses every possible location.
+            wires: Which wires may hold a rotation:
+
+                * ``"all"``: Dope every possible wire.
+                * ``"after_entangling"``: Dope only wires directly after multi-qubit gates.
+                * ``"before_entangling"``: Dope only wires directly before multi-qubit gates.
+
+            angle: Rotation angle for each inserted :class:`~qiskit.circuit.library.RZGate`.
+                ``None`` instead gives each rotation its own parameter from a
+                :class:`~qiskit.circuit.ParameterVector` named ``dope``. The rotation on the
+                returned ``doped_wires[i]`` gets ``dope[i]``, so a list of angles binds in
+                ``doped_wires`` order.
+            seed: Seed or generator for the random site selection.
+            box: Whether to box the doped circuit, as :meth:`box` boxes :attr:`circuit`.
+            payload_layers: The ``payload_layers`` argument of :meth:`box`. Only used with
+                ``box=True``.
+            box_options: Overrides for
+                :func:`~samplomatic.transpiler.generate_boxing_pass_manager`, as the
+                ``**kwargs`` of :meth:`box`. Only used with ``box=True``.
+
+        Returns:
+            ``(doped_circuit, doped_wires)``: a copy of :attr:`circuit` with the rotations
+            inserted, and the :class:`~qiskit_paulice.wire.Wire` holding each rotation, in
+            circuit order and with instruction indices into :attr:`circuit`. The checks and classical bits
+            are unchanged, so :meth:`get_postselection_method` applies to the doped circuit's
+            results.
+
+        Raises:
+            ValueError: :attr:`circuit` contains a non-Clifford instruction, or uses a qubit after
+                its measurement.
+            ValueError: ``wires`` is not one of the allowed values.
+            ValueError: ``payload_layers`` or ``box_options`` is given without ``box=True``, or
+                :meth:`box` rejects the doped circuit.
+            ValueError: ``num_sites`` is negative, larger than the number of valid sites, or
+                that many sites could not be drawn at random from them.
+
+        Example:
+            Dope a one-qubit circuit with parametrized rotations, then bind their angles:
+
+            .. code-block:: python
+
+                import numpy as np
+                from qiskit import QuantumCircuit
+                from qiskit_paulice import CheckedCircuit
+
+                circuit = QuantumCircuit(1)
+                circuit.h(0)
+                circuit.h(0)
+                circuit.h(0)
+                circuit.measure_all()
+
+                doped_circuit, doped_wires = CheckedCircuit(circuit).dope(angle=None)
+                print(doped_wires)
+                # (Wire(qubit=0, after_instruction=0), Wire(qubit=0, after_instruction=1))
+                # dope[0] follows the first H gate, and dope[1] follows the second.
+
+                bound = doped_circuit.assign_parameters([np.pi / 4, np.pi / 8])
+        """
+        if not box and (payload_layers is not None or box_options is not None):
+            raise ValueError("payload_layers and box_options require box=True.")
+        doped, sites = _dope_circuit(
+            self.circuit, self.check_qubits, self.check_support, num_sites, wires, angle, seed
+        )
+        if box:
+            doped = self._box(doped, payload_layers, box_options or {})
+        return doped, tuple(sites)
+
     def box(
         self,
         payload_layers: Iterable[Iterable[tuple[int, int]]] | None = None,
@@ -337,7 +426,16 @@ class CheckedCircuit:
             ValueError: :attr:`circuit` contains an instruction other than one- and two-qubit
                 unitary gates, measurements, and barriers.
         """
-        for instruction in self.circuit.data:
+        return self._box(self.circuit, payload_layers, kwargs)
+
+    def _box(
+        self,
+        circuit: QuantumCircuit,
+        payload_layers: Iterable[Iterable[tuple[int, int]]] | None,
+        options: Mapping[str, Any],
+    ) -> QuantumCircuit:
+        """Box ``circuit``, which carries this circuit's checks; see :meth:`box`."""
+        for instruction in circuit.data:
             operation = instruction.operation
             if operation.name in _NON_GATES:
                 continue
@@ -346,8 +444,9 @@ class CheckedCircuit:
                     f"'{operation.name}' is not supported: a checked circuit may contain only "
                     "one- and two-qubit unitary gates, measurements, and barriers."
                 )
-        options = {**BOXING_DEFAULTS, **kwargs}
-        return generate_boxing_pass_manager(**options).run(self._stratify(payload_layers))
+        return generate_boxing_pass_manager(**{**BOXING_DEFAULTS, **options}).run(
+            self._stratify(circuit, payload_layers)
+        )
 
     @cached_property
     def _cb_to_q(self) -> dict[int, int]:
@@ -369,9 +468,9 @@ class CheckedCircuit:
         return sub_array
 
     def _stratify(
-        self, payload_layers: Iterable[Iterable[tuple[int, int]]] | None
+        self, circuit: QuantumCircuit, payload_layers: Iterable[Iterable[tuple[int, int]]] | None
     ) -> QuantumCircuit:
-        """Return a copy of the checked circuit that is separated into layers.
+        """Return a copy of ``circuit``, which carries this circuit's checks, separated into layers.
 
         This method isolates entangling gates that are part of a Pauli check into
         their own stratum and maintains the payload layer scheduling. This has the
@@ -379,7 +478,6 @@ class CheckedCircuit:
         fewer unique entangling layers for which to learn noise.
         """
         # Unpack circuit into lists of instructions and qubit indices
-        circuit = self.circuit
         ancillas = set(self.check_qubits)
         data = [inst for inst in circuit.data if inst.operation.name != "barrier"]
         indices = [[circuit.find_bit(q).index for q in inst.qubits] for inst in data]
@@ -492,7 +590,7 @@ def _fault_channels(
     """
     try:
         gates, _ = _convert_to_rustiq_circuit(circuit)
-    except (ValueError, AssertionError) as exc:
+    except ValueError as exc:
         raise ValueError(f"Non-Clifford instruction in circuit: {exc}") from exc
 
     num_qubits = circuit.num_qubits

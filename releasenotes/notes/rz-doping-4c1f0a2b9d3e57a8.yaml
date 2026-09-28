@@ -1,0 +1,6 @@
+---
+features:
+  - |
+    Added the new :meth:`qiskit_paulice.checked_circuit.CheckedCircuit.dope` method, which adds ``RZ`` rotations
+    that commute with all spacetime check stabilizers. See `arXiv:2607.25941 <https://arxiv.org/abs/2607.25941>`__
+    for details.

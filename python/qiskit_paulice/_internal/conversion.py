@@ -35,27 +35,26 @@ _NAMES_CONVERSION = {
 
 
 def convert_to_rustiq_circuit(circuit):
-    """Convert a qiskit circuit to rustiq's gate list, plus a qiskit-index map.
+    """Convert a Clifford Qiskit circuit to rustiq's gate list, plus a Qiskit-index map.
 
-    The second returned list ``qiskit_inst_indices`` runs parallel to
-    ``rustiq_circuit``: ``qiskit_inst_indices[i]`` is the index into
-    ``circuit.data`` of the qiskit ``CircuitInstruction`` that emitted the
-    i-th rustiq gate. Some qiskit instructions emit zero rustiq gates (e.g.
-    ``measure``, ``barrier``, ``id``, ``rz(0)``); some emit two (``x``, ``z``,
-    ``rz(pi)``). This lets callers translate rustiq-side wire references back
-    to positions in the original qiskit circuit.
+    Measurements and barriers are skipped. ``x`` and ``z`` become two ``SqrtX`` or two ``S``
+    gates, and ``rz``/``u1`` rotations by a multiple of pi/2 become zero, one or two ``S``/``Sd``
+    gates (equal up to a global phase); ``id`` and rotations by a multiple of 2 pi emit nothing.
 
-    Measurements and barriers are ignored as they are not part of the Clifford
-    circuit logic.
+    Args:
+        circuit: The circuit, built from ``cx``, ``cz``, ``h``, ``s``, ``sdg``, ``sx``,
+            ``sxdg``, ``x``, ``z``, ``rz``, ``u1``, ``id``, ``measure`` and ``barrier``.
+
+    Returns:
+        ``(rustiq_circuit, qiskit_inst_indices)``: the list of ``(gate_name, qubit_indices)``
+        pairs, and a parallel list whose ``i``-th entry is the index into ``circuit.data`` of
+        the instruction that emitted the ``i``-th gate, for translating rustiq-side wire
+        references back to positions in ``circuit``.
+
+    Raises:
+        ValueError: ``circuit`` contains any other instruction, an ``rz``/``u1`` with an
+            unbound parameter, or one whose angle is not a real multiple of pi/2.
     """
-    # Filter out measurements and barriers when checking gate set
-    gate_names = set(
-        q.operation.name for q in circuit if q.operation.name not in ("measure", "barrier")
-    )
-    assert gate_names <= set(
-        ("cx", "h", "s", "x", "z", "sx", "sxdg", "sdg", "cz", "rz", "u1", "id")
-    ), f"Gate set is: {gate_names}"
-
     rustiq_circuit = []
     qiskit_inst_indices = []
 
@@ -73,26 +72,27 @@ def convert_to_rustiq_circuit(circuit):
             raise ValueError(f"Unsupported gate {gate}")
         name = _NAMES_CONVERSION[gate.operation.name]
         if name == "RZ":
-            param = gate.operation.params[0]
-            if isinstance(param, (np.complex128, np.complex64, complex)):
-                param = float(np.real(param))
-            param = param % (2 * np.pi)
-            if np.isclose(param, 0.0) or np.isclose(param, 2 * np.pi):
-                continue
-            if np.isclose(param, np.pi / 2):
-                emit(("S", qbits), inst_idx)
-                continue
-            if np.isclose(param, np.pi):
-                emit(("S", qbits), inst_idx)
-                emit(("S", qbits), inst_idx)
-                continue
-            if np.isclose(param, 3 * np.pi / 2):
-                emit(("Sd", qbits), inst_idx)
-                continue
-            emit(("RZ", qbits, str(param)), inst_idx)
-        elif name == "I":
+            try:
+                param = complex(gate.operation.params[0])
+            except TypeError as exc:
+                raise ValueError(
+                    f"Unsupported gate {gate}: unbound parameter; bind it to a multiple of pi/2"
+                ) from exc
+            # Round to the nearest quarter turn with one absolute tolerance, so that
+            # e.g. rz(-eps) and rz(eps) are classified alike.
+            quarter_turns = param.real / (np.pi / 2)
+            nearest = round(quarter_turns)
+            if abs(param.imag) > 1e-8 or abs(quarter_turns - nearest) > 1e-8:
+                raise ValueError(
+                    f"Unsupported gate {gate}: non-Clifford rz angle {param:.4g} (not a real "
+                    "multiple of pi/2)"
+                )
+            for rustiq_name in ((), ("S",), ("S", "S"), ("Sd",))[nearest % 4]:
+                emit((rustiq_name, qbits), inst_idx)
             continue
-        elif name == "X":
+        if name == "I":
+            continue
+        if name == "X":
             emit(("SqrtX", qbits), inst_idx)
             emit(("SqrtX", qbits), inst_idx)
         elif name == "Z":
@@ -104,8 +104,7 @@ def convert_to_rustiq_circuit(circuit):
 
 
 def convert_to_qiskit_circuit(circuit, nqbits):
-    """Turns a rustiq circuit into a qiskit circuit
-    """
+    """Turns a rustiq circuit into a qiskit circuit"""
     qs_circuit = QuantumCircuit(nqbits)
     for gate, qbits in circuit:
         if gate == "H":

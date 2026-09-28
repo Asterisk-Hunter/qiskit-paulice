@@ -163,6 +163,17 @@ class TestCheckedCircuit(unittest.TestCase):
         cc = CheckedCircuit(circuit=_bell_with_measure())
         self.assertIs(cc.uncovered_paulis, cc.uncovered_paulis)
 
+    def test_uncovered_paulis_non_clifford_raises(self):
+        """A non-Clifford gate raises ``ValueError``, as documented."""
+        t_circuit = QuantumCircuit(2)
+        t_circuit.t(0)
+        rz_circuit = QuantumCircuit(2)
+        rz_circuit.rz(0.3, 0)
+        for circuit in (t_circuit, rz_circuit):
+            circuit.cz(0, 1)
+            with self.subTest(circuit=circuit), self.assertRaises(ValueError):
+                _ = CheckedCircuit(circuit).uncovered_paulis
+
     def test_postselection_bitstring_with_measurements(self):
         """Bitstring path uses ``measure`` instructions to map clbits to qubits."""
         cc = CheckedCircuit(
@@ -273,7 +284,7 @@ class TestIsolatedCheckLayers(unittest.TestCase):
 
     def test_same_circuit(self):
         """Isolating check gates doesn't change the unitary the circuit implements."""
-        stripped = self.checked._stratify(None)
+        stripped = self.checked._stratify(self.checked.circuit, None)
         self.assertEqual(_gate_counts(self.checked.circuit), _gate_counts(stripped))
         original = RemoveBarriers()(self.checked.circuit.remove_final_measurements(inplace=False))
         restratified = RemoveBarriers()(stripped.remove_final_measurements(inplace=False))
